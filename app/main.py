@@ -17,6 +17,13 @@ from starlette.websockets import WebSocketState
 from .config import settings
 from .debug_store import store
 from .realtime_client import OpenAIRealtimeClient
+# NYTT: extraherad append + commit-policy
+from .stt.send_audio_to_realtime import (
+    init_audio_sender_state,
+    start_commit_loop,
+    stop_commit_loop,
+    handle_audio_chunk,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("stt")
@@ -153,16 +160,21 @@ async def ws_transcribe(ws: WebSocket):
     # Hålla senaste text för enkel diff
     last_text = ""
     
-    # Flagga för att veta om vi har skickat ljud
-    has_audio = False
-    last_audio_time = 0  # Timestamp för senaste ljud
+    # NYTT: initiera och starta extraherad commit-policy
+    audio_state = init_audio_sender_state(idle_timeout_s=2.0)
+    commit_task = await start_commit_loop(
+        state=audio_state,
+        rt=rt,
+        commit_interval_ms=settings.commit_interval_ms,
+        logger=log,
+    )
 
     # Task: läs events från Realtime och skicka deltas till frontend
     async def on_rt_event(evt: dict):
         nonlocal last_text
         t = evt.get("type")
 
-        # (A) logga alltid eventtyp för felsökning (/debug/rt-events om ni har det)
+        # (A) logga alltid eventtyp för felsökning (/debug/rt-events)
         try:
             buffers.rt_events.append(str(t))
         except Exception:
@@ -182,18 +194,18 @@ async def ws_transcribe(ws: WebSocket):
         # (C) försök extrahera transcript från flera varianter
         transcript = None
 
-        # 1) Klassisk Realtime-transkript (som repo 2 använder) - whisper-1 + server VAD
+        # 1) Klassisk Realtime-transkript - whisper-1 + server VAD
         if t == "conversation.item.input_audio_transcription.completed":
             transcript = (
                 evt.get("transcript")
                 or evt.get("item", {}).get("content", [{}])[0].get("transcript")
             )
 
-        # 2) Alternativ nomenklatur: response.audio_transcript.delta/completed
+        # 2) Alternativ nomenklatur
         if not transcript and t in ("response.audio_transcript.delta", "response.audio_transcript.completed"):
             transcript = evt.get("transcript") or evt.get("text") or evt.get("delta")
 
-        # 3) Sista fallback: response.output_text.delta (text-delning)
+        # 3) Fallback: text-delta
         if not transcript and t == "response.output_text.delta":
             delta_txt = evt.get("delta")
             if isinstance(delta_txt, str):
@@ -208,7 +220,6 @@ async def ws_transcribe(ws: WebSocket):
         if delta and ws.client_state == WebSocketState.CONNECTED:
             buffers.openai_text.append(transcript)
             
-            # Bestäm om detta är final eller partial transcript
             is_final = t in (
                 "conversation.item.input_audio_transcription.completed",
                 "response.audio_transcript.completed",
@@ -220,43 +231,11 @@ async def ws_transcribe(ws: WebSocket):
                     "text": transcript
                 })
             else:
-                await ws.send_text(delta)  # fallback: ren text
+                await ws.send_text(delta)
             buffers.frontend_text.append(delta)
             last_text = transcript
 
     rt_recv_task = asyncio.create_task(rt.recv_loop(on_rt_event))
-
-    # Periodisk commit för att få löpande partials
-    async def commit_loop():
-        try:
-            while True:
-                await asyncio.sleep(max(0.001, settings.commit_interval_ms / 1000))
-                # Bara committa om vi har skickat ljud
-                if has_audio:
-                    # Kontrollera om det har gått för lång tid sedan senaste ljudet
-                    import time
-                    if time.time() - last_audio_time > 2.0:  # 2 sekunder timeout
-                        has_audio = False
-                        log.debug("Timeout - återställer has_audio flaggan")
-                        continue
-                    
-                    try:
-                        await rt.commit()
-                    except Exception as e:
-                        # Hantera "buffer too small" fel mer elegant
-                        if "buffer too small" in str(e) or "input_audio_buffer_commit_empty" in str(e):
-                            log.debug("Buffer för liten, väntar på mer ljud: %s", e)
-                            # Om buffern är helt tom, återställ has_audio flaggan
-                            if "0.00ms of audio" in str(e):
-                                has_audio = False
-                            continue  # Fortsätt loopen istället för att bryta
-                        else:
-                            log.warning("Commit fel: %s", e)
-                            break
-        except asyncio.CancelledError:
-            pass
-
-    commit_task = asyncio.create_task(commit_loop())
 
     try:
         while ws.client_state == WebSocketState.CONNECTED:
@@ -267,23 +246,23 @@ async def ws_transcribe(ws: WebSocket):
                     chunk = msg["bytes"]
                     buffers.frontend_chunks.append(len(chunk))
                     try:
-                        await rt.send_audio_chunk(chunk)
-                        buffers.openai_chunks.append(len(chunk))
-                        has_audio = True  # Markera att vi har skickat ljud
-                        import time
-                        last_audio_time = time.time()  # Uppdatera timestamp
+                        # NYTT: extraherad append + stateuppdatering
+                        await handle_audio_chunk(
+                            state=audio_state,
+                            rt=rt,
+                            buffers=buffers,
+                            chunk=chunk,
+                            logger=log,
+                        )
                     except Exception as e:
                         log.error("Fel när chunk skickades till Realtime: %s", e)
                         break
                 elif "text" in msg and msg["text"] is not None:
-                    # Tillåt ping/ctrl meddelanden som sträng
                     if msg["text"] == "ping":
                         await ws.send_text("pong")
                     else:
-                        # ignoreras
                         pass
                 else:
-                    # okänt format
                     pass
 
             except WebSocketDisconnect:
@@ -296,7 +275,8 @@ async def ws_transcribe(ws: WebSocket):
                 log.error("WebSocket fel: %s", e)
                 break
     finally:
-        commit_task.cancel()
+        # stäng commit-loop + eventloop
+        await stop_commit_loop(audio_state)
         rt_recv_task.cancel()
         try:
             await rt.close()
@@ -306,7 +286,6 @@ async def ws_transcribe(ws: WebSocket):
             await asyncio.gather(commit_task, rt_recv_task, return_exceptions=True)
         except Exception:
             pass
-        # Stäng WebSocket bara om den inte redan är stängd
         if ws.client_state != WebSocketState.DISCONNECTED:
             try:
                 await ws.close()
@@ -317,5 +296,4 @@ async def ws_transcribe(ws: WebSocket):
 # Alias route för /ws som använder samma logik som /ws/transcribe
 @app.websocket("/ws")
 async def ws_alias(ws: WebSocket):
-    # Återanvänd exakt samma logik som i ws_transcribe
     await ws_transcribe(ws)
